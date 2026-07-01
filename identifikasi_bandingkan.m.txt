@@ -1,0 +1,134 @@
+function identifikasi_bandingkan(xlsxFile)
+% IDENTIFIKASI_BANDINGKAN
+% Pipeline identifikasi sistem Steam Drum (single-input single-output),
+% DIPOTONG sampai perbandingan model & pemilihan model terbaik saja.
+%   Input  (u): Flow Inlet Economizer
+%   Output (y): Pressure Main Steam
+%
+% Langkah: baca data -> buang zona mati -> split estimasi/validasi ->
+% pilih orde ARX (AIC) -> estimasi 8 struktur model -> bandingkan fit ->
+% tentukan model terbaik. (Tanpa diagnostik, grafik, atau fungsi alih.)
+%
+% Cara pakai:
+%   identifikasi_bandingkan            % default: IDEN (2).xlsx
+%   identifikasi_bandingkan('namafile.xlsx')
+%
+% Butuh: System Identification Toolbox.
+
+if nargin < 1 || isempty(xlsxFile)
+    xlsxFile = 'IDEN (2).xlsx';
+end
+Ts    = 1;                 % sample time (berbasis indeks cuplik)
+SHEET = 'Sheet1';
+COL_U = 'Flow Inlet Economizer';
+COL_Y = 'Pressure Main Steam';
+outRoot = fullfile(pwd, 'results');
+if ~exist(outRoot,'dir'); mkdir(outRoot); end
+
+%% ====================== BACA DATA ======================
+T  = readtable(xlsxFile, 'Sheet', SHEET, 'VariableNamingRule','preserve');
+vn = string(T.Properties.VariableNames);
+
+uIdx = find(strcmpi(vn, COL_U), 1);
+yIdx = find(strcmpi(vn, COL_Y), 1);
+if isempty(uIdx) || isempty(yIdx)
+    warning('Nama kolom tidak ketemu, memakai kolom ke-2 dan ke-3.');
+    uIdx = 2; yIdx = 3;
+end
+u  = double(T{:, uIdx});
+y  = double(T{:, yIdx});
+N0 = numel(y);
+fprintf('Data dibaca (%s!%s): %d sampel\n', xlsxFile, SHEET, N0);
+
+%% ====================== BUANG ZONA MATI ======================
+w   = 30;                               % lebar jendela
+thr = 0.05 * std(y,'omitnan');          % ambang std (5% dari std global)
+sld = movstd(y, w);
+active = sld > max(thr, eps);
+ia = find(active, 1, 'first');
+ib = find(active, 1, 'last');
+if isempty(ia); ia = 1; ib = N0; end
+seg = ia:ib;
+u = u(seg); y = y(seg);
+N = numel(y);
+fprintf('Zona mati terdeteksi & dibuang. Segmen terpakai: %d..%d (%d titik)\n', ...
+        seg(1), seg(end), N);
+
+data = iddata(y, u, Ts);
+data = detrend(data, 0);                % buang mean (operating point)
+data.InputName  = COL_U;
+data.OutputName = COL_Y;
+
+%% ====================== SPLIT ESTIMASI / VALIDASI ======================
+nE = round(0.70 * N);
+ze = data(1:nE);
+zv = data(nE+1:end);
+fprintf('Estimasi: %d sampel | Validasi: %d sampel\n', nE, N-nE);
+
+%% ====================== PILIH ORDE ARX (AIC) ======================
+fprintf('\n=== IDENTIFIKASI LINIER ===\n');
+NN  = struc(1:3, 1:3, 1:2);             % kandidat na, nb, nk
+V   = arxstruc(ze, zv, NN);
+ord = selstruc(V, 'aic');               % orde terbaik via AIC
+na = ord(1); nb = ord(2); nk = ord(3);
+fprintf('Orde ARX terpilih (AIC): na=%d nb=%d nk=%d\n', na, nb, nk);
+
+%% ====================== ESTIMASI MODEL & PERBANDINGAN ======================
+fprintf('\n=== IDENTIFIKASI & PERBANDINGAN MODEL ===\n');
+models = {}; names = {}; schemes = {};
+
+% Bungkam peringatan "Estimation of initial states failed" yang tidak
+% berbahaya (ARMAX/OE/BJ memakai nilai awal nol). Dikembalikan setelahnya.
+wstate = warning('off','all');
+cleanupW = onCleanup(@() warning(wstate));
+
+% --- Linier ---
+try, mARX   = arx(ze,   [na nb nk]);     models{end+1}=mARX;   names{end+1}='ARX';                schemes{end+1}='Linier';    catch ME, warn_model('ARX',ME);    end
+try, mARMAX = armax(ze, [na nb 1 nk]);   models{end+1}=mARMAX; names{end+1}='ARMAX';              schemes{end+1}='Linier';    catch ME, warn_model('ARMAX',ME);  end
+try, mOE    = oe(ze,    [nb na nk]);      models{end+1}=mOE;    names{end+1}='OE';                 schemes{end+1}='Linier';    catch ME, warn_model('OE',ME);     end
+try, mBJ    = bj(ze,    [nb 1 1 na nk]);  models{end+1}=mBJ;    names{end+1}='BJ';                 schemes{end+1}='Linier';    catch ME, warn_model('BJ',ME);     end
+try, mSS    = n4sid(ze, 2);               models{end+1}=mSS;    names{end+1}='State-Space';        schemes{end+1}='Linier';    catch ME, warn_model('State-Space',ME); end
+try, mTF    = tfest(ze, 2, 1);            models{end+1}=mTF;    names{end+1}='TF';                 schemes{end+1}='Linier';    catch ME, warn_model('TF',ME);     end
+
+% --- Nonlinier ---
+try, mNLARX = nlarx(ze, [na nb nk], idSigmoidNetwork); models{end+1}=mNLARX; names{end+1}='NLARX'; schemes{end+1}='Nonlinier'; catch ME, warn_model('NLARX',ME); end
+try, mHW    = nlhw(ze,  [nb na nk]);      models{end+1}=mHW;    names{end+1}='Hammerstein-Wiener'; schemes{end+1}='Nonlinier'; catch ME, warn_model('Hammerstein-Wiener',ME); end
+
+% --- hitung fit (simulation) pada data validasi ---
+fitv = zeros(numel(models),1);
+for k = 1:numel(models)
+    try
+        [~, fk] = compare(zv, models{k});
+        fitv(k) = fk;
+    catch
+        fitv(k) = NaN;
+    end
+end
+
+Tres = table(names(:), schemes(:), round(fitv,2), ...
+             'VariableNames', {'Model','Skema','Fit_persen'});
+Tres = sortrows(Tres, 'Fit_persen', 'descend');
+disp(Tres);
+
+[~, ib2] = max(fitv);
+fprintf('Model terbaik: %s (fit = %.2f%%)\n', names{ib2}, fitv(ib2));
+
+% simpan tabel perbandingan ke CSV
+csvPath = fullfile(outRoot, 'tabel_fit.csv');
+try
+    writetable(Tres, csvPath);
+    fprintf('Tabel -> %s\n', csvPath);
+catch
+    stamp = datestr(now, 'yyyymmdd_HHMMSS');
+    alt = fullfile(outRoot, sprintf('tabel_fit_%s.csv', stamp));
+    writetable(Tres, alt);
+    fprintf('Warning: %s terkunci. Disimpan sebagai: %s\n', csvPath, alt);
+end
+
+fprintf('\nSelesai.\n');
+end
+
+% ----------------------------------------------------------------------
+function warn_model(nm, ME)
+    fprintf('  [lewati %s] %s\n', nm, ME.message);
+end
